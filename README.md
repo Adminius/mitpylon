@@ -31,6 +31,8 @@ Only this messages of original Pylontech Protocol are sopported:
 # Requirments
 This YAML was tested on ESP32 C6 with 2 CAN-Bus transceiver and modified ESPHome esp32_can component, to handle 2x internal CAN-busses
 
+![Connection diagram](connection.png "Connection diagram")
+
 It should be possible to use any ESP32 with one CAN-Bus transceiver and one MCP2515 SPI CAN-Controller (not tested)
 
 Tested with JK Inverter BMS and Deye SUN12K Inverter

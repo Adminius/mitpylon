@@ -17,15 +17,10 @@ substitutions:
 # voltage offset for inverter to compensate voltage drop in cabling or to force inverter (e.g. Deye) to go higher with a voltage to reach charge voltage level
   offset_voltage: "0.5"
 
-# hardware settings
-  battery_modules: "1"
-
 #BMS specific:
   charge_current: "150"
   discharge_current: "150"
 
-
-  
 
 esphome:
   name: ${name}
@@ -48,8 +43,6 @@ esp32:
       CONFIG_USE_MINIMAL_MDNS: y
       CONFIG_ESPTOOLPY_FLASHSIZE_8MB: y
       CONFIG_ESP_CONSOLE_USB_CDC: y
-
-# all others ESPs
 
 # for ESP32 C6 only because of two CAN-busses
 external_components:
@@ -200,7 +193,8 @@ canbus:
   #    can_id_mask: 0
   #    then:
   #      - lambda: |-
-  #          ESP_LOGI("BMS:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
+  #          ESP_LOGI("BMS:", "0x%x%02x: %02x %02x %02x %02x %02x %02x %02x %02x", (uint8_t)(can_id >> 8), (uint8_t)(can_id & 0xFF), x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
+
 
     - can_id: 0x351
       then:
@@ -241,6 +235,7 @@ canbus:
             id(battery_current).publish_state(current);
             float temperature = ((x[5] << 8) | x[4]) / 10;
             id(battery_temperature).publish_state(temperature);
+            id(battery_power).publish_state(voltage * current);
             for(uint8_t i = 0; i < 8; i++){ id(can356)[i] = x[i]; }
 #            ESP_LOGI("canid 0x356:", "U: %.1f V, I: %.1f A, T: %.1f °C", voltage, current, temperature );
 
@@ -281,6 +276,33 @@ canbus:
         - lambda: |-
              for(uint8_t i = 0; i < 8; i++){ id(can35e)[i] = x[i]; }
 #             ESP_LOGI("canid 0x35E:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
+
+# special not official PYLON messages:
+    - can_id: 0x370
+      then:
+        - lambda: |-
+            float max_cell_temp = ((x[1] << 8) | x[0]);
+            id(max_cell_temperature).publish_state(max_cell_temp);
+            float min_cell_temp = ((x[3] << 8) | x[2]);
+            id(min_cell_temperature).publish_state(min_cell_temp);
+            float max_cell_volt = float((x[5] << 8) | x[4]) / 1000.0;
+            id(max_cell_voltage).publish_state(max_cell_volt);
+            float min_cell_volt = float((x[7] << 8) | x[6]) / 1000.0;
+            id(min_cell_voltage).publish_state(min_cell_volt);
+#            ESP_LOGI("canid 0x370:", "Tmax: %.1f °C, Tmin: %.1f °C, Umax: %.3f V, Umin: %.3f V", max_cell_temp, min_cell_temp, max_cell_volt, min_cell_volt);
+    
+    - can_id: 0x371
+      then:
+        - lambda: |-        
+            int max_cell_temp_id = ((x[1] << 8) | x[0]);
+            id(max_cell_temperature_id).publish_state(max_cell_temp_id);
+            int min_cell_temp_id = ((x[3] << 8) | x[2]);
+            id(min_cell_temperature_id).publish_state(min_cell_temp_id);
+            int max_cell_volt_id = ((x[5] << 8) | x[4]);
+            id(max_cell_voltage_id).publish_state(max_cell_volt_id);
+            int min_cell_volt_id = ((x[7] << 8) | x[6]);
+            id(min_cell_voltage_id).publish_state(min_cell_volt_id);
+#            ESP_LOGI("canid 0x371:", "Tmax ID: %d, Tmin ID: %d, Umax ID: %d, Umin ID: %d", max_cell_temp_id, min_cell_temp_id, max_cell_volt_id, min_cell_volt_id);
 
 # send messages
 interval:
@@ -324,7 +346,6 @@ interval:
                     can_id: 0x359 # Protection & Alarm flags
                     data: !lambda |-
                       uint8_t can_mesg[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-                      can_mesg[4] = ${battery_modules}; // Modules in parallel
                       return {can_mesg[0], can_mesg[1], can_mesg[2], can_mesg[3], can_mesg[4], can_mesg[5], can_mesg[6], can_mesg[7]};
       - if:
           condition: 
@@ -522,10 +543,78 @@ sensor:
     state_class: 'measurement'
     accuracy_decimals: 0
 
+# Calculated power
+  - platform: template
+    name: "Battery power"
+    id: "battery_power"
+    unit_of_measurement: 'W'
+    device_class: 'power'
+    state_class: 'measurement'
+    accuracy_decimals: 0   
+
+# 0x370 max/min temperature/cell voltage
+  - platform: template
+    name: "Max. cell temperature"
+    id: "max_cell_temperature"
+    unit_of_measurement: '°C'
+    device_class: 'temperature'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Min. cell temperature"
+    id: "min_cell_temperature"
+    unit_of_measurement: '°C'
+    device_class: 'temperature'
+    state_class: 'measurement'
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Max. cell voltage"
+    id: "max_cell_voltage"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    state_class: 'measurement'
+    accuracy_decimals: 3 
+
+  - platform: template
+    name: "Min. cell voltage"
+    id: "min_cell_voltage"
+    unit_of_measurement: 'V'
+    device_class: 'voltage'
+    state_class: 'measurement'
+    accuracy_decimals: 3 
+
+# 0x371 max/min temperature/cell voltage cell number
+  - platform: template
+    name: "Max. cell temperature ID"
+    id: "max_cell_temperature_id"
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Min. cell temperature ID"
+    id: "min_cell_temperature_id"
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Max. cell voltage ID"
+    id: "max_cell_voltage_id"
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Min. cell voltage ID"
+    id: "min_cell_voltage_id"
+    state_class: 'measurement'
+    accuracy_decimals: 0
+
+
 # 0x359 byte 4
   - platform: template
     name: "Module number"
-    id: "modul_numbers"
+    id: "module_number"
     state_class: 'measurement'
     accuracy_decimals: 0
 
