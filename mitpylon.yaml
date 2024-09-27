@@ -8,19 +8,14 @@
 # https://github.com/Sleeper85/esphome-jk-bms-can
 
 
-
-
 substitutions:
   name: mitpylon
   device_description: "Man In The Middle Adapter For Pylontech Communication Protocol"
 
-# voltage offset for inverter to compensate voltage drop in cabling or to force inverter (e.g. Deye) to go higher with a voltage to reach charge voltage level
-  offset_voltage: "0.5"
-
 #BMS specific:
-  charge_current: "150"
-  discharge_current: "150"
-
+  charge_current: "250"
+  discharge_current: "280"
+  
 
 esphome:
   name: ${name}
@@ -53,17 +48,18 @@ external_components:
 # Enable logging
 logger:
   level: INFO # DEBUG # INFO
+  tx_buffer_size: 2048
   baud_rate: 0
   hardware_uart: USB_CDC # USB_CDC
 
 # Enable Home Assistant API
 api:
   encryption:
-    key: "PUT_YOUR_KEY_HERE"
+    key: !secret api_mitpylon
 
 ota:
   - platform: esphome
-    password: "PUT_YOUR_PASSWORD_HERE"
+    password: !secret ota_mitpylon
 
 wifi:
   ssid: !secret wifi_ssid
@@ -88,18 +84,6 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
-  - id: canStepCounter
-    type: int
-    restore_value: no
-    initial_value: '0'
-  - id: initDone
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: noBmsError
-    type: bool
-    restore_value: no
-    initial_value: 'true'
   - id: force100soc
     type: bool
     restore_value: no
@@ -113,32 +97,6 @@ globals:
     restore_value: no
     initial_value: '0'
 
-#save original BMS messages here
-  - id: can351
-    type: int[8]
-    restore_value: no
-    initial_value: '{0,0,0,0,0,0,0,0}'
-  - id: can355
-    type: int[8]
-    restore_value: no
-    initial_value: '{0,0,0,0,0,0,0,0}'
-  - id: can356
-    type: int[8]
-    restore_value: no
-    initial_value: '{0,0,0,0,0,0,0,0}'
-  - id: can359
-    type: int[8]
-    restore_value: no
-    initial_value: '{0,0,0,0,0,0,0,0}'
-  - id: can35c
-    type: int[8]
-    restore_value: no
-    initial_value: '{0,0,0,0,0,0,0,0}'
-  - id: can35e
-    type: int[8]
-    restore_value: no
-    initial_value: '{0,0,0,0,0,0,0,0}'
-
 time:
 # charge battery to 100% each sunday to calibrate cells and BMS
   - platform: sntp
@@ -150,6 +108,12 @@ time:
       then:
         lambda: |-
           id(force100soc) = true;
+
+# for MCP2515
+#spi:
+#  miso_pin: GPIO01
+#  mosi_pin: GPIO02
+#  clk_pin: GPIO4
 
 canbus:
 
@@ -165,12 +129,13 @@ canbus:
     - can_id: 0x305
       then:
         - lambda: |-
-            id(can305Counter) = 0;
+            id(can305Counter) = 0;  //inverter is connected
+            id(inverter_connected).publish_state(true);
 #            ESP_LOGI("main", "received can id: 0x305 ACK");
 
 # NOT TESTED:
 #- platform: mcp2515
-#    cs_pin: GPIOXX
+#    cs_pin: GPIO03
 #    can_id: 100
 #    bit_rate: 500kbps
 #    on_frame:
@@ -189,12 +154,11 @@ canbus:
     can_id: 200
     bit_rate: 500KBPS
     on_frame:
-  #  - can_id: 0
-  #    can_id_mask: 0
-  #    then:
-  #      - lambda: |-
-  #          ESP_LOGI("BMS:", "0x%x%02x: %02x %02x %02x %02x %02x %02x %02x %02x", (uint8_t)(can_id >> 8), (uint8_t)(can_id & 0xFF), x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
-
+#    - can_id: 0
+#      can_id_mask: 0
+#      then:
+#        - lambda: |-
+#            ESP_LOGI("BMS:", "0x%x%02x: %02x %02x %02x %02x %02x %02x %02x %02x", (uint8_t)(can_id >> 8), (uint8_t)(can_id & 0xFF), x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);
 
     - can_id: 0x351
       then:
@@ -203,17 +167,49 @@ canbus:
             id(battery_charge_voltage).publish_state(u_max);
             // assume, that the highest voltage is RCV! 
             // Attention!!! if RCV will be changed to lower voltage in BMS, reboot of mitpylon device is necessary!!!
-            if(id(saveRcv) < u_max) {
-              id(saveRcv) = u_max; 
+            if(id(saveRcv) < u_max) id(saveRcv) = u_max; 
+            uint16_t chargeCurrent = ((x[3] << 8) | x[2]) / 10;
+            id(battery_charge_current_limit).publish_state(chargeCurrent);
+            uint16_t dischargeCurrent = ((x[5] << 8) | x[4]) / 10;
+            id(battery_discharge_current_limit).publish_state(dischargeCurrent);
+            id(noBmsUpdateCounter) = 0;  //bms is connected
+            id(bms_connected).publish_state(true);
+
+            uint8_t canMessage[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            uint16_t chargeVoltage = (uint16_t)((id(battery_charge_voltage).state + id(charge_voltage_offset).state) * 10);
+            canMessage[0] = (uint8_t)(chargeVoltage & 0xFF);
+            canMessage[1] = (uint8_t)(chargeVoltage >> 8);
+            canMessage[6] = 0x1A; //Discharge voltage 41.6V => 2.6V per cell
+            canMessage[7] = 0x01; //Discharge voltage 41.6V
+            if((id(charge_to_90_only).state == true && id(battery_soc).state >= 90 && !id(force100soc)) || !id(charging_allowed).state || !id(set_charging_allowed).state){
+              /* if charging is not allowed, set current to 0, Deye don't like 0 and start discharging, so set to 1 amp (0x0A / 10 = 1A)  */
+              canMessage[2] = 0x0A;
+              canMessage[3] = 0x00;
+            }else{
+              if(id(set_charge_current_limit).state <= chargeCurrent / 10) { 
+                chargeCurrent = (uint16_t)(id(set_charge_current_limit).state) * 10; 
+                canMessage[2] = (uint8_t)(chargeCurrent & 0xFF);
+                canMessage[3] = (uint8_t)(chargeCurrent >> 8);
+              }else{
+                canMessage[2] = (uint8_t)x[2];
+                canMessage[3] = (uint8_t)x[3];
+              }
             }
-            int i_charge = ((x[3] << 8) | x[2]) / 10;
-            id(battery_charge_current_limit).publish_state(i_charge);
-            int i_discharge = ((x[5] << 8) | x[4]) / 10;
-            id(battery_discharge_current_limit).publish_state(i_discharge);
-            for(uint8_t i = 0; i < 8; i++){ id(can351)[i] = x[i]; }
-            if(!id(initDone)) id(initDone) = true;
-            id(noBmsUpdateCounter) = 0;
-          #  ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, i_charge, i_discharge);
+            if(!id(charging_allowed).state || !id(set_charging_allowed).state) {
+              /* if charging is not allowed, set current to 0*/
+              canMessage[4] = 0x00;
+              canMessage[5] = 0x00;
+            }else{
+              if(id(set_discharge_current_limit).state * 10 <= dischargeCurrent) {
+                dischargeCurrent = (uint16_t)(id(set_discharge_current_limit).state) * 10;
+              }
+            }
+            canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
+            canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
+            //ESP_LOGI("canid 0x351:", "%02x %02x %02x %02x %02x %02x %02x %02x", canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]);
+            std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
+            id(inverter)->send_data(can_id, false, data);
+          #  ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent, dischargeCurrent);
 
     - can_id: 0x355
       then:
@@ -223,7 +219,41 @@ canbus:
             int soh = ((x[3] << 8) | x[2]);
             id(battery_soh).publish_state(soh);
             if(id(invSoc) >= 100) id(force100soc) = false;
-            for(uint8_t i = 0; i < 8; i++){ id(can355)[i] = x[i]; }
+            uint8_t socByte0 = 0;
+            uint8_t socByte1 = 0;
+            // if SoC 100% (RCV/RFV) control is enabled, send max. 99% SoC to inverter until float voltage is reached.
+            // Logic: if soc_100_rcv_rfv_control == false or SoC under 99%: send data 1:1 from bms to inverter
+            // if soc_100_rcv_rfv_control == true and BMS SoC 99% or 100% wait until float-stage and then send 100%
+            if(id(soc_100_rcv_rfv_control).state && id(battery_soc).state >= 99){
+              if (id(battery_charge_voltage).state < id(saveRcv)){
+                  //float-stage, send 100% SoC to inverter
+                  socByte0 = 0x64;
+                  socByte1 = 0x00;
+                  id(invSoc) = 100;
+                  //ESP_LOGI("To Inv 0x355", "float stage");
+              }else{
+                  //still charge voltage -> not yet fully charged, send 99% SoC to inverter
+                  socByte0 = 0x63;
+                  socByte1 = 0x00;
+                  id(invSoc) = 99;
+                  //ESP_LOGI("To Inv 0x355", "charging stage");
+              }
+            }else{
+              //Dirty hack to discharge battery to 0%: send 2% instead of 1%, because Deye stops at 1%
+              if((uint8_t)x[0] == 1){
+                socByte0 = 0x02;
+                socByte1 = 0x00;
+                id(invSoc) = (socByte1 << 8) | socByte0;
+              }else{
+                //no modifications, send BMS data directly to inverter
+                socByte0 = (uint8_t)x[0];
+                socByte1 = (uint8_t)x[1];
+                id(invSoc) = (socByte1 << 8) | socByte0;
+              }
+            }
+            //ESP_LOGI("canid 0x359:", "invSoc: %d %%", id(invSoc));
+            std::vector< uint8_t > data{socByte0, socByte1, x[2], x[3], x[4], x[5], x[6], x[7]};
+            id(inverter)->send_data(can_id, false, data);
 #            ESP_LOGI("canid 0x355:", "SoC %d %, SoH %d %",soc, soh );
     - can_id: 0x356
       then:
@@ -236,7 +266,7 @@ canbus:
             float temperature = ((x[5] << 8) | x[4]) / 10;
             id(battery_temperature).publish_state(temperature);
             id(battery_power).publish_state(voltage * current);
-            for(uint8_t i = 0; i < 8; i++){ id(can356)[i] = x[i]; }
+            id(inverter)->send_data(can_id, false, x);
 #            ESP_LOGI("canid 0x356:", "U: %.1f V, I: %.1f A, T: %.1f °C", voltage, current, temperature );
 
     - can_id: 0x35C
@@ -247,8 +277,16 @@ canbus:
             id(request_force_charge_1).publish_state(x[0] & 0x20);
             id(request_force_charge_2).publish_state(x[0] & 0x10);
             id(request_full_charge).publish_state(x[0] & 0x08);
-            for(uint8_t i = 0; i < 8; i++){ id(can35c)[i] = x[i]; }
-#            ESP_LOGI("canid 0x35C:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);    
+            uint8_t message = 0x00;
+            if(id(charging_allowed).state && id(set_charging_allowed).state) message = 0x80;
+            if(id(discharging_allowed).state && id(set_discharging_allowed).state) message = message | 0x40;
+            if(id(request_force_charge_1).state || id(set_charge_request).state) message = message | 0x20;
+            if(id(request_force_charge_2).state) message = message | 0x10;
+            if(id(request_full_charge).state) message = message | 0x08;
+            //ESP_LOGI("canid 0x35C:", "%02x", message);
+            std::vector< uint8_t > data{ message, x[1], x[2], x[3], x[4], x[5], x[6], x[7]};
+            id(inverter)->send_data(can_id, false, data);
+            //ESP_LOGI("canid 0x35C:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]);    
     
     - can_id: 0x359
       then:
@@ -267,17 +305,20 @@ canbus:
             id(cell_module_high_voltage).publish_state(x[2] & 0x02);
             id(internal_communication_error).publish_state(x[3] & 0x08); 
             id(charge_high_current).publish_state(x[3] & 0x01);
-            id(modul_numbers).publish_state(x[4]);
-            for(uint8_t i = 0; i < 8 ;i++){ id(can359)[i] = x[i]; }
-#            ESP_LOGI("canid 0x359:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
+            id(module_number).publish_state(x[4]);
+            id(inverter)->send_data(can_id, false, x);
+            //ESP_LOGI("canid 0x359:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
 
     - can_id: 0x35E
       then:
+# Deye SUN12K uses the strange implementation, and uses 0x35E as protocol definition for own batteries
+# e.g. "JK-BMS" will not be shown in Deye, but "PYLON". So, rewrite it to fixed "PYLON"
         - lambda: |-
-             for(uint8_t i = 0; i < 8; i++){ id(can35e)[i] = x[i]; }
-#             ESP_LOGI("canid 0x35E:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
+            std::vector< uint8_t > data{0x50, 0x59, 0x4C, 0x4F, 0x4E, 0x00, 0x00, 0x00};
+            id(inverter)->send_data(can_id, false, x);
+            //ESP_LOGI("canid 0x35E:", "%02x %02x %02x %02x %02x %02x %02x %02x", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]); 
 
-# special not official PYLON messages:
+# special not official PYLON messages, JK-inverter-BMS specific?
     - can_id: 0x370
       then:
         - lambda: |-
@@ -289,7 +330,7 @@ canbus:
             id(max_cell_voltage).publish_state(max_cell_volt);
             float min_cell_volt = float((x[7] << 8) | x[6]) / 1000.0;
             id(min_cell_voltage).publish_state(min_cell_volt);
-#            ESP_LOGI("canid 0x370:", "Tmax: %.1f °C, Tmin: %.1f °C, Umax: %.3f V, Umin: %.3f V", max_cell_temp, min_cell_temp, max_cell_volt, min_cell_volt);
+            //ESP_LOGI("canid 0x370:", "Tmax: %.1f °C, Tmin: %.1f °C, Umax: %.3f V, Umin: %.3f V", max_cell_temp, min_cell_temp, max_cell_volt, min_cell_volt);
     
     - can_id: 0x371
       then:
@@ -302,181 +343,29 @@ canbus:
             id(max_cell_voltage_id).publish_state(max_cell_volt_id);
             int min_cell_volt_id = ((x[7] << 8) | x[6]);
             id(min_cell_voltage_id).publish_state(min_cell_volt_id);
-#            ESP_LOGI("canid 0x371:", "Tmax ID: %d, Tmin ID: %d, Umax ID: %d, Umin ID: %d", max_cell_temp_id, min_cell_temp_id, max_cell_volt_id, min_cell_volt_id);
+            //ESP_LOGI("canid 0x371:", "Tmax ID: %d, Tmin ID: %d, Umax ID: %d, Umin ID: %d", max_cell_temp_id, min_cell_temp_id, max_cell_volt_id, min_cell_volt_id);
+
 
 # send messages
 interval:
-  - interval: 166ms #6 messages per second ~166ms
+  - interval: 1s
     then:
-      - if:
-          condition:
-            lambda: |-
-              if (id(initDone) && id(canStepCounter) == 0) {
-                id(canStepCounter) = 1;
-                id(noBmsError) = false;
-                return true;
-              } else if (id(canStepCounter) != 0) {
-                if (id(can305Counter) > 30) {
-                  ESP_LOGI("main", "No rx can 0x305 reply, Inverter not connected/responding, Rebooting...");
-                  //id(restart_button).press(); # TODO uncomment
-                  id(can305Counter) = 0;
-                } else {
-                  id(can305Counter) ++;
-                }
+      lambda: |-
+        if (id(can305Counter) > 30) {
+          ESP_LOGI("main", "No rx can 0x305 reply since 30 sec, Inverter not connected/responding...");
+          id(inverter_connected).publish_state(false);
+          id(can305Counter) = 0;
+        } else {
+          id(can305Counter) ++;
+        }
 
-                id(canStepCounter)++;
-                return true;
-
-              } else if (id(noBmsUpdateCounter)++ >= 10) { //~10 sek
-                id(noBmsError) = true;
-                id(noBmsUpdateCounter) = 10;
-                id(canStepCounter) = 1;
-                return true;
-              }
-              return false;
-
-          then:
-           - if:
-                condition:
-                  lambda: |-
-                    return id(canStepCounter) == 1;
-                then:
-                  canbus.send: # Warning, Alarms
-                    canbus_id: inverter
-                    can_id: 0x359 # Protection & Alarm flags
-                    data: !lambda |-
-                      uint8_t can_mesg[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-                      return {can_mesg[0], can_mesg[1], can_mesg[2], can_mesg[3], can_mesg[4], can_mesg[5], can_mesg[6], can_mesg[7]};
-      - if:
-          condition: 
-            lambda: |-
-              return id(canStepCounter) == 2;
-          then:
-            canbus.send: # Bat Max/Min Voltage, Charge/Discharge current
-              canbus_id: inverter
-              can_id: 0x351 
-              data: !lambda |-
-                uint8_t canMessage[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-                uint16_t chargeCurrent = (uint8_t)id(can351)[3] << 8 | (uint8_t)id(can351)[2];
-                uint16_t dischargeCurrent = (uint8_t)id(can351)[5] << 8 | (uint8_t)id(can351)[4]; 
-                uint16_t chargeVoltage = (uint16_t)((id(battery_charge_voltage).state + ${offset_voltage}) * 10);
-                canMessage[0] = (uint8_t)(chargeVoltage & 0xFF);
-                canMessage[1] = (uint8_t)(chargeVoltage >> 8);
-                canMessage[6] = 0xE0; //Discharge voltage 48V
-                canMessage[7] = 0x01; //Discharge voltage 48V
-                if((id(charge_to_90_only).state == true && id(battery_soc).state >= 90 && !id(force100soc)) || !id(charging_allowed).state || !id(set_charging_allowed).state){
-                  /* if charging is not allowed, set current to 0, Deye don't like 0 and start discharging, so set to 1 amp (0x0A / 10 = 1A)  */
-                  canMessage[2] = 0x0A;
-                  canMessage[3] = 0x00;
-                }else{
-                  if(id(set_charge_current_limit).state <= chargeCurrent / 10) { 
-                    chargeCurrent = (uint16_t)(id(set_charge_current_limit).state) * 10; 
-                    canMessage[2] = (uint8_t)(chargeCurrent & 0xFF);
-                    canMessage[3] = (uint8_t)(chargeCurrent >> 8);
-                  }else{
-                    canMessage[2] = (uint8_t)id(can351)[2];
-                    canMessage[3] = (uint8_t)id(can351)[3];
-                  }
-                }
-                if(!id(charging_allowed).state || !id(set_charging_allowed).state) {
-                  /* if charging is not allowed, set current to 0*/
-                  canMessage[4] = 0x00;
-                  canMessage[5] = 0x00;
-                }else{
-                  if(id(set_discharge_current_limit).state * 10 <= dischargeCurrent) {
-                    dischargeCurrent = (uint16_t)(id(set_discharge_current_limit).state) * 10;
-                  }
-                }
-                canMessage[4] = (uint8_t)(dischargeCurrent & 0xFF);
-                canMessage[5] = (uint8_t)(dischargeCurrent >> 8);
-                //ESP_LOGI("canid 0x351:", "%02x %02x %02x %02x %02x %02x %02x %02x", canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]);
-                return {canMessage[0], canMessage[1], canMessage[2], canMessage[3] , canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
-              
-
-      - if: 
-          condition:
-            lambda: |-
-              return id(canStepCounter) == 3;
-          then:
-            canbus.send: # SoC, SoH
-              canbus_id: inverter
-              can_id: 0x355 
-              data: !lambda |-
-                uint8_t socByte0 = 0;
-                uint8_t socByte1 = 0;
-                // if SoC 100% (RCV/RFV) control is enabled, send max. 99% SoC to inverter until float voltage is reached.
-                // Logic: if soc_100_rcv_rfv_control == false or SoC under 99%: send data 1:1 from bms to inverter
-                // if soc_100_rcv_rfv_control == true and BMS SoC 99% or 100% wait until float-stage and then send 100%
-                if(id(soc_100_rcv_rfv_control).state && id(battery_soc).state >= 99){
-                  if (id(battery_charge_voltage).state < id(saveRcv)){
-                      //float-stage, send 100% SoC to inverter
-                      socByte0 = 0x64;
-                      socByte1 = 0x00;
-                      id(invSoc) = 100;
-                      //ESP_LOGI("To Inv 0x355", "float stage");
-                  }else{
-                      //still charge voltage -> not yet fully charged, send 99% SoC to inverter
-                      socByte0 = 0x63;
-                      socByte1 = 0x00;
-                      id(invSoc) = 99;
-                      //ESP_LOGI("To Inv 0x355", "charging stage");
-                  }
-                }else{
-                  //no modifications, send BMS data directly to inverter
-                  socByte0 = (uint8_t)id(can355)[0];
-                  socByte1 = (uint8_t)id(can355)[1];
-                  id(invSoc) = (socByte1 << 8) | socByte0;
-                }
-                //ESP_LOGI("canid 0x359:", "invSoc: %d %%", id(invSoc));
-                //ESP_LOGI("canid 0x359:", "%02x %02x %02x %02x %02x %02x %02x %02x", socByte0, socByte1, (uint8_t)id(can355)[2], (uint8_t)id(can355)[3], (uint8_t)id(can355)[4], (uint8_t)id(can355)[5], (uint8_t)id(can355)[6], (uint8_t)id(can355)[7]); 
-                return {socByte0, socByte1, (uint8_t)id(can355)[2], (uint8_t)id(can355)[3], (uint8_t)id(can355)[4], (uint8_t)id(can355)[5], (uint8_t)id(can355)[6], (uint8_t)id(can355)[7]};
-
-      - if: 
-          condition:
-            lambda: |-
-              return id(canStepCounter) == 4;
-          then:
-            canbus.send: # V, I, Temp
-              canbus_id: inverter
-              can_id: 0x356 
-              data: !lambda |-
-                return {(uint8_t)id(can356)[0], (uint8_t)id(can356)[1], (uint8_t)id(can356)[2], (uint8_t)id(can356)[3], (uint8_t)id(can356)[4], (uint8_t)id(can356)[5], (uint8_t)id(can356)[6], (uint8_t)id(can356)[7]};
-
-# 0x35C: it's not allowed to (dis)charge if BMS doesn't allows it. So check and add to user settings
-# Only if user sets "true" and BMS is also "true", than "allowed".
-# "Set request" is OR connected
-      - if: 
-          condition:
-            lambda: |-
-              return id(canStepCounter) == 5;
-          then:
-            canbus.send: # Charge enable, Discharge enable, Charge Request
-              canbus_id: inverter
-              can_id: 0x35C 
-              data: !lambda |-
-                uint8_t message = 0x00;
-                if(id(charging_allowed).state && id(set_charging_allowed).state) message = 0x80;
-                if(id(discharging_allowed).state && id(set_discharging_allowed).state) message = message | 0x40;
-                if(id(request_force_charge_1).state || id(set_charge_request).state) message = message | 0x20;
-                if(id(request_force_charge_2).state) message = message | 0x10;
-                if(id(request_full_charge).state) message = message | 0x08;
-                //ESP_LOGI("canid 0x35C:", "%02x", message);
-                return {message, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-
-# Deye SUN12K uses strange implementation and uses 0x35E as protocol definition for own batteries
-# e.g. "JK-BMS" will not be shown in Deye, but "PYLON". So, rewrite it to fixed "PYLON"
-      - if:
-          condition:
-            lambda: |-
-              return id(canStepCounter) == 6;
-          then:
-            - canbus.send:
-                canbus_id: inverter
-                can_id: 0x35E
-                data: [0x50, 0x59, 0x4C, 0x4F, 0x4E, 0x00, 0x00, 0x00] # "PYLON"
-            - lambda: |- 
-                id(canStepCounter) = 0;
+        if (id(noBmsUpdateCounter) > 30) {
+          ESP_LOGI("main", "No rx from BMS since 30 sec, not connected/responding...");
+          id(bms_connected).publish_state(false);
+          id(noBmsUpdateCounter) = 0;
+        } else {
+          id(noBmsUpdateCounter) ++;
+        }
 
 sensor:
   - platform: template
@@ -552,6 +441,7 @@ sensor:
     state_class: 'measurement'
     accuracy_decimals: 0   
 
+
 # 0x370 max/min temperature/cell voltage
   - platform: template
     name: "Max. cell temperature"
@@ -609,7 +499,6 @@ sensor:
     id: "min_cell_voltage_id"
     state_class: 'measurement'
     accuracy_decimals: 0
-
 
 # 0x359 byte 4
   - platform: template
@@ -700,6 +589,15 @@ binary_sensor:
     name: "Charge high current"
     id: "charge_high_current"
 
+# CAN status
+  - platform: template
+    name: "Inverter connected"
+    id: "inverter_connected"
+
+  - platform: template
+    name: "BMS connected"
+    id: "bms_connected"
+
 #Control
 number:
   - platform: template
@@ -713,7 +611,6 @@ number:
     optimistic: True
     restore_value: True
     
-
   - platform: template
     name: "Set discharge current limit"
     id: "set_discharge_current_limit"
@@ -722,6 +619,17 @@ number:
     max_value: ${discharge_current}
     min_value: 0
     step: 1
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "Charge voltage offset"
+    id: "charge_voltage_offset"
+    unit_of_measurement: 'A'
+    device_class: 'current'
+    max_value: 1.0
+    min_value: 0.0
+    step: 0.1
     optimistic: True
     restore_value: True
 
