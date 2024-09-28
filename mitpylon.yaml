@@ -15,7 +15,6 @@ substitutions:
 #BMS specific:
   charge_current: "250"
   discharge_current: "280"
-  
 
 esphome:
   name: ${name}
@@ -135,7 +134,7 @@ canbus:
 
 # NOT TESTED:
 #- platform: mcp2515
-#    cs_pin: GPIO03
+#    cs_pin: GPIOXX
 #    can_id: 100
 #    bit_rate: 500kbps
 #    on_frame:
@@ -168,13 +167,12 @@ canbus:
             // assume, that the highest voltage is RCV! 
             // Attention!!! if RCV will be changed to lower voltage in BMS, reboot of mitpylon device is necessary!!!
             if(id(saveRcv) < u_max) id(saveRcv) = u_max; 
-            uint16_t chargeCurrent = ((x[3] << 8) | x[2]) / 10;
-            id(battery_charge_current_limit).publish_state(chargeCurrent);
-            uint16_t dischargeCurrent = ((x[5] << 8) | x[4]) / 10;
-            id(battery_discharge_current_limit).publish_state(dischargeCurrent);
+            uint16_t chargeCurrent = ((x[3] << 8) | x[2]);
+            id(battery_charge_current_limit).publish_state(chargeCurrent / 10);
+            uint16_t dischargeCurrent = ((x[5] << 8) | x[4]);
+            id(battery_discharge_current_limit).publish_state(dischargeCurrent / 10);
             id(noBmsUpdateCounter) = 0;  //bms is connected
             id(bms_connected).publish_state(true);
-
             uint8_t canMessage[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
             uint16_t chargeVoltage = (uint16_t)((id(battery_charge_voltage).state + id(charge_voltage_offset).state) * 10);
             canMessage[0] = (uint8_t)(chargeVoltage & 0xFF);
@@ -209,7 +207,7 @@ canbus:
             //ESP_LOGI("canid 0x351:", "%02x %02x %02x %02x %02x %02x %02x %02x", canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]);
             std::vector< uint8_t > data{canMessage[0], canMessage[1], canMessage[2], canMessage[3], canMessage[4], canMessage[5], canMessage[6], canMessage[7]};
             id(inverter)->send_data(can_id, false, data);
-          #  ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent, dischargeCurrent);
+            //ESP_LOGI("canid 0x351:", "U_max: %.1f V, I_charge %d A, I_discharge: %d A", u_max, chargeCurrent / 10, dischargeCurrent / 10);
 
     - can_id: 0x355
       then:
